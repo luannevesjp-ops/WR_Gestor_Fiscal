@@ -3170,9 +3170,9 @@ CERTIDOES_DIAS_VENCENDO = 15   # vencendo: até 15 dias antes; vencida: a partir
 
 _CND_STATUS = ["Negativa", "Positiva c/ Efeito de Negativa", "Positiva", "Sem CND"]
 _CND_CORES  = {"Negativa": "#27ae60", "Positiva c/ Efeito de Negativa": "#2e86de",
-               "Positiva": "#e74c3c", "Sem CND": "#95a5a6"}
+               "Positiva": "#e74c3c", "Sem CND": "#95a5a6", "Filial": "#8e44ad"}
 _CND_FUNDOS = {"Negativa": "#f0faf4", "Positiva c/ Efeito de Negativa": "#eef5fc",
-               "Positiva": "#fdf2f2", "Sem CND": "#f4f6f6"}
+               "Positiva": "#fdf2f2", "Sem CND": "#f4f6f6", "Filial": "#f5eef8"}
 
 
 def _cnpj_digitos(val):
@@ -3257,13 +3257,17 @@ def _certidoes_links_pdf():
 
 def _certidoes_monta(df_empresas, df_aba, so_matriz, links_pdf):
     """Uma linha por empresa ATIVA (sem CEI), com a situação da CND casada pelo
-    CNPJ. Empresa que não está na aba (ou está sem situação) = Sem CND."""
+    CNPJ. Empresa que não está na aba (ou está sem situação) = Sem CND.
+    so_matriz (FEDERAL): a CND sai pela raiz do CNPJ, então a filial entra com
+    situação "Filial" (conta no total, não nos status) e com o PDF da matriz."""
     df = df_empresas[
         (df_empresas["Situação"].astype(str).str.strip().str.upper() == "ATIVA") &
         (df_empresas["Regime"].astype(str).str.strip().str.upper() != "CEI")
     ].copy()
     if so_matriz and "MATRIZ / FILIAL" in df.columns:
-        df = df[df["MATRIZ / FILIAL"].astype(str).str.strip().str.upper() != "FILIAL"]
+        eh_filial = df["MATRIZ / FILIAL"].astype(str).str.strip().str.upper() == "FILIAL"
+    else:
+        eh_filial = pd.Series(False, index=df.index)
 
     df["_cnpj"] = df["CNPJ"].apply(_cnpj_digitos)
     df["Código"] = df["Código"].apply(_limpa_codigo_sf)
@@ -3280,12 +3284,14 @@ def _certidoes_monta(df_empresas, df_aba, so_matriz, links_pdf):
             val = dict(zip(aba["_cnpj"], pd.to_datetime(datas, format="%d/%m/%Y", errors="coerce")))
 
     df["Situação CND"] = df["_cnpj"].map(sit).apply(_cnd_classifica)
+    df.loc[eh_filial, "Situação CND"] = "Filial"
     validade = pd.to_datetime(df["_cnpj"].map(val), errors="coerce")
+    validade[eh_filial] = pd.NaT
     hoje = pd.Timestamp(date.today())
     dias = (validade - hoje).dt.days
 
     def _venc(d, s):
-        if s == "Sem CND" or pd.isna(d):
+        if s in ("Sem CND", "Filial") or pd.isna(d):
             return "—"
         if d < 0:
             return "Vencida"
@@ -3298,6 +3304,11 @@ def _certidoes_monta(df_empresas, df_aba, so_matriz, links_pdf):
     df["Vencimento"] = [_venc(d, s) for d, s in zip(dias, df["Situação CND"])]
     df["CNPJ"] = df["_cnpj"].apply(lambda c: _formata_cnpj_mascara(c) if c else "")
     df["PDF"] = df["Código"].map(links_pdf).fillna("")
+    if eh_filial.any():
+        raiz = df["_cnpj"].str[:8]
+        com_pdf = ~eh_filial & (df["PDF"] != "")
+        pdf_matriz = dict(zip(raiz[com_pdf], df.loc[com_pdf, "PDF"]))
+        df.loc[eh_filial, "PDF"] = raiz[eh_filial].map(pdf_matriz).fillna("")
 
     colunas = ["PDF", "Código", "Razão Social", "CNPJ", "Regime", "Município", "Estado",
                "Situação CND", "Validade", "Dias", "Vencimento"]
@@ -3359,25 +3370,30 @@ def _certidoes_grid(df_tabela, grid_key):
            enable_enterprise_modules=False, allow_unsafe_jscode=True, reload_data=False)
 
 
-def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs):
+def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs, n_cei):
     import plotly.graph_objects as go
 
-    cont = {s: int((df_cert["Situação CND"] == s).sum()) for s in _CND_STATUS}
+    status    = _CND_STATUS + (["Filial"] if so_matriz else [])
+    cont = {s: int((df_cert["Situação CND"] == s).sum()) for s in status}
     vencidas  = int((df_cert["Vencimento"] == "Vencida").sum())
     vencendo  = int((df_cert["Vencimento"] == "Vencendo").sum())
     total     = len(df_cert)
-    base      = "empresas ativas (só matriz), sem CEI" if so_matriz else "empresas ativas, sem CEI"
+    base      = ("matriz com a CND; a filial usa a da matriz (raiz do CNPJ)"
+                 if so_matriz else "todas as empresas ativas")
 
     st.markdown(
-        f"<p style='text-align:right; font-size:18px;'>"
+        f"<p style='text-align:right; font-size:16px;'>"
         f"<b>Negativas:</b> {cont['Negativa']} &nbsp;|&nbsp; "
         f"<b>Positivas c/ efeito de negativa:</b> {cont['Positiva c/ Efeito de Negativa']} &nbsp;|&nbsp; "
         f"<b>Positivas:</b> {cont['Positiva']} &nbsp;|&nbsp; "
         f"<b>Sem CND:</b> {cont['Sem CND']} &nbsp;|&nbsp; "
-        f"<b>Total:</b> {total}</p>",
+        + (f"<b>Filiais:</b> {cont['Filial']} &nbsp;|&nbsp; " if so_matriz else "")
+        + f"<b>CEI (não participa):</b> {n_cei} &nbsp;|&nbsp; "
+        f"<b>Total geral:</b> {total + n_cei}</p>",
         unsafe_allow_html=True,
     )
-    st.caption(f"Total = {base}. Situação e validade: aba **{aba}** da planilha · "
+    st.caption(f"Total geral = empresas ativas da lista ({total} no gráfico + {n_cei} CEI, que "
+               f"não entram nas CNDs). {esfera}: {base}. Situação e validade: aba **{aba}** da planilha · "
                f"{n_pdfs} PDF(s) na pasta {esfera}/{CERTIDOES_ESCRITORIO} do Drive.")
     if not aba_existe:
         st.warning(f"A aba **{aba}** ainda não existe na planilha — todas as empresas "
@@ -3385,10 +3401,10 @@ def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs):
 
     # ── donut (mesmo padrão do menu SIMPLES NACIONAL) ──────────────────────────
     fig = go.Figure(data=[go.Pie(
-        labels=_CND_STATUS,
-        values=[cont[s] for s in _CND_STATUS],
+        labels=status,
+        values=[cont[s] for s in status],
         hole=0.68,
-        marker=dict(colors=[_CND_CORES[s] for s in _CND_STATUS],
+        marker=dict(colors=[_CND_CORES[s] for s in status],
                     line=dict(color="#ffffff", width=3)),
         textinfo="none",
         hovertemplate="<b>%{label}</b><br>%{value} empresa(s) — %{percent}<extra></extra>",
@@ -3417,8 +3433,8 @@ def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs):
             unsafe_allow_html=True,
         )
 
-    cols = st.columns(len(_CND_STATUS))
-    for col, s in zip(cols, _CND_STATUS):
+    cols = st.columns(len(status))
+    for col, s in zip(cols, status):
         with col:
             pct = round(cont[s] / total * 100) if total else 0
             _card(_CND_CORES[s], _CND_FUNDOS[s], cont[s], f"{s} ({pct}%)")
@@ -3445,7 +3461,7 @@ def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs):
     opcoes = {
         f"Vencidas ({vencidas})": ("Vencimento", "Vencida"),
         f"Vencendo ({vencendo})": ("Vencimento", "Vencendo"),
-        **{f"{s} ({cont[s]})": ("Situação CND", s) for s in _CND_STATUS},
+        **{f"{s} ({cont[s]})": ("Situação CND", s) for s in status},
     }
     sel = st.pills("Filtro", list(opcoes), selection_mode="single",
                    key=f"pill_cert_{esfera}")
@@ -3490,12 +3506,74 @@ def pagina_certidoes():
         st.warning(f"Não foi possível ler a pasta de PDFs no Drive ({erro_drive}). "
                    f"As certidões aparecem sem o link do PDF.")
 
+    ativas = df[df["Situação"].astype(str).str.strip().str.upper() == "ATIVA"]
+    n_cei = int((ativas["Regime"].astype(str).str.strip().str.upper() == "CEI").sum())
+
+    todas = {esfera: _certidoes_monta(df, abas.get(aba), so_matriz, links.get(esfera, {}))
+             for esfera, (aba, so_matriz) in CERTIDOES_ESFERAS.items()}
+    _certidoes_consulta_empresa(todas)
+
     tabs = st.tabs(list(CERTIDOES_ESFERAS))
     for tab, (esfera, (aba, so_matriz)) in zip(tabs, CERTIDOES_ESFERAS.items()):
         with tab:
-            df_cert = _certidoes_monta(df, abas.get(aba), so_matriz, links.get(esfera, {}))
-            _certidoes_esfera(esfera, df_cert, aba, abas.get(aba) is not None,
-                              so_matriz, len(links.get(esfera, {})))
+            _certidoes_esfera(esfera, todas[esfera], aba, abas.get(aba) is not None,
+                              so_matriz, len(links.get(esfera, {})), n_cei)
+
+
+def _certidoes_consulta_empresa(todas):
+    """Escolhe uma empresa e mostra as 3 CNDs dela lado a lado."""
+    base = next(iter(todas.values()))
+    if base.empty:
+        return
+    rotulos = {
+        r["Código"]: f"{r['Código']} — {r['Razão Social']} — {r['CNPJ']}"
+        for _, r in base.iterrows()
+    }
+    with st.container(border=True):
+        st.markdown("**🔍 Consultar empresa** — as 3 certidões (Federal, Estadual e Municipal)")
+        cod = st.selectbox("Empresa", list(rotulos), index=None, format_func=rotulos.get,
+                           placeholder="Digite o código, nome ou CNPJ",
+                           label_visibility="collapsed", key="cert_busca_empresa")
+        if not cod:
+            return
+
+        cols = st.columns(len(todas))
+        for col, (esfera, df_e) in zip(cols, todas.items()):
+            linha = df_e[df_e["Código"] == cod]
+            if linha.empty:
+                continue
+            r = linha.iloc[0]
+            obs = ""
+            # CND Federal é emitida pela raiz do CNPJ: filial usa a da matriz
+            if esfera == "FEDERAL" and r["Situação CND"] in ("Sem CND", "Filial"):
+                raiz = re.sub(r"\D", "", str(r["CNPJ"]))[:8]
+                mesma_raiz = df_e[(df_e["CNPJ"].str.replace(r"\D", "", regex=True).str[:8] == raiz)
+                                  & (~df_e["Situação CND"].isin(["Sem CND", "Filial"]))]
+                if raiz and not mesma_raiz.empty:
+                    r = mesma_raiz.iloc[0]
+                    obs = f"Da matriz (cód. {r['Código']})"
+
+            sit = r["Situação CND"]
+            cor = _CND_CORES[sit]
+            venc = r["Vencimento"]
+            cor_venc = {"Vencida": "#c0392b", "Vencendo": "#e67e22", "Em dia": "#27ae60"}.get(venc, "#7f8c8d")
+            dias = "" if pd.isna(r["Dias"]) else f" · {int(r['Dias'])} dia(s)"
+            with col:
+                st.markdown(
+                    f"<div style='padding:10px 12px; background:{_CND_FUNDOS[sit]}; "
+                    f"border-radius:8px; border-left:4px solid {cor}; min-height:130px;'>"
+                    f"<div style='font-size:13px; color:#555; font-weight:700;'>{esfera}</div>"
+                    f"<div style='font-size:18px; font-weight:700; color:{cor};'>{sit}</div>"
+                    f"<div style='font-size:13px; color:#333;'>Validade: <b>{r['Validade'] or '—'}</b></div>"
+                    f"<div style='font-size:13px; color:{cor_venc}; font-weight:600;'>{venc}{dias}</div>"
+                    f"<div style='font-size:12px; color:#777;'>{obs}</div></div>",
+                    unsafe_allow_html=True,
+                )
+                if r["PDF"]:
+                    st.link_button("📄 Abrir PDF", r["PDF"], use_container_width=True)
+                else:
+                    st.button("PDF não encontrado", disabled=True, use_container_width=True,
+                              key=f"cert_busca_sem_pdf_{esfera}")
 
 
 # ============================================================================
