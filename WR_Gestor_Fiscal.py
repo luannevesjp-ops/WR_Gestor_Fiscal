@@ -3513,11 +3513,14 @@ def pagina_certidoes():
              for esfera, (aba, so_matriz) in CERTIDOES_ESFERAS.items()}
     _certidoes_consulta_empresa(todas)
 
-    tabs = st.tabs(list(CERTIDOES_ESFERAS))
-    for tab, (esfera, (aba, so_matriz)) in zip(tabs, CERTIDOES_ESFERAS.items()):
-        with tab:
-            _certidoes_esfera(esfera, todas[esfera], aba, abas.get(aba) is not None,
-                              so_matriz, len(links.get(esfera, {})), n_cei)
+    # Seletor em vez de st.tabs: o AgGrid dentro de uma aba que não está aberta
+    # no carregamento nasce com tamanho zero e a lista não aparece ao trocar de aba.
+    # Assim só a esfera escolhida é desenhada.
+    esfera = st.segmented_control("Esfera", list(CERTIDOES_ESFERAS), default="FEDERAL",
+                                  label_visibility="collapsed", key="cert_esfera") or "FEDERAL"
+    aba, so_matriz = CERTIDOES_ESFERAS[esfera]
+    _certidoes_esfera(esfera, todas[esfera], aba, abas.get(aba) is not None,
+                      so_matriz, len(links.get(esfera, {})), n_cei)
 
 
 def _certidoes_consulta_empresa(todas):
