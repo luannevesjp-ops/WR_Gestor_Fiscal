@@ -1358,6 +1358,155 @@ if st.session_state["pagina_atual"] != pagina:
 # PÁGINAS
 # ============================================================================
 
+# ============================================================================
+# EMPRESAS — INCLUIR / EXCLUIR (grava na aba GERAL da planilha do escritório)
+# ============================================================================
+# Apps Script COMPARTILHADO (PROGRAMA/SCRIPTS_COMPARTILHADOS/apps_script_empresas.gs):
+# mesma URL em todos os escritórios, cada um manda o seu EMPRESAS_ESCRITORIO.
+#   - incluir: a empresa entra na 1ª linha com a coluna A vazia e sem fórmula;
+#   - excluir: NÃO apaga nada — só troca a Situação da empresa para INATIVA.
+EMPRESAS_SCRIPT_URL = ""
+EMPRESAS_ESCRITORIO = "WR"
+
+_REGIMES_EMPRESA = ["SIMPLES NACIONAL", "LUCRO PRESUMIDO", "LUCRO REAL", "MEI",
+                    "NÃO OPTANTE", "CEI", "CONDOMINIO"]
+
+
+def _empresas_enviar(acao, empresas):
+    """POST pro Apps Script de empresas. (True, resposta) ou (False, mensagem)."""
+    if not EMPRESAS_SCRIPT_URL:
+        return False, ("gravação de empresas ainda não configurada (falta publicar "
+                       "apps_script_empresas.gs e preencher EMPRESAS_SCRIPT_URL).")
+    try:
+        resp = requests.post(EMPRESAS_SCRIPT_URL, timeout=60, json={
+            "escritorio": EMPRESAS_ESCRITORIO, "acao": acao, "empresas": empresas,
+        })
+        resp.raise_for_status()
+        corpo = resp.json()
+    except Exception as e:
+        return False, str(e)
+    if corpo.get("status") == "ok":
+        return True, corpo
+    return False, corpo.get("message", "erro desconhecido")
+
+
+def _empresas_mensagens():
+    # mensagens guardadas antes do st.rerun() (senão somem na hora)
+    for tipo, texto in st.session_state.pop("emp_msgs", []):
+        (st.success if tipo == "ok" else st.error)(texto)
+
+
+def _empresas_ativas(df):
+    ativas = df[df["Situação"].astype(str).str.strip().str.upper() == "ATIVA"].copy()
+    ativas["_cnpj"] = ativas["CNPJ"].apply(_cert_cnpj_digitos) if "CNPJ" in ativas else ""
+    ativas["_cod"] = ativas["Código"].apply(_limpa_codigo_sf) if "Código" in ativas else ""
+    return ativas
+
+
+def _empresas_form_incluir(df, aviso=st):
+    # aviso: área acima do formulário onde aparecem os erros
+    ativas = _empresas_ativas(df)
+    regimes = list(_REGIMES_EMPRESA)
+    if "Regime" in df.columns:
+        for r in df["Regime"].dropna().astype(str).str.strip().str.upper().unique():
+            if r and r not in ("NAN", "NONE") and r not in regimes:
+                regimes.append(r)
+
+    with st.container(border=True):
+        st.markdown("**➕ Incluir empresa**")
+        with st.form("form_emp_incluir"):
+            razao = st.text_input("Razão Social *")
+            c1, c2 = st.columns(2)
+            cnpj = c1.text_input("CNPJ / CPF *")
+            codigo = c2.text_input("Código *")
+            regime = st.selectbox("Regime *", regimes, index=None, placeholder="Escolha o regime")
+            c3, c4 = st.columns([3, 1])
+            municipio = c3.text_input("Município")
+            estado = c4.text_input("Estado (UF)", max_chars=2)
+            enviar = st.form_submit_button("➕ Incluir na planilha", type="primary")
+
+        if enviar:
+            dig = re.sub(r"\D", "", cnpj)
+            cod = _limpa_codigo_sf(codigo)
+            erro = ""
+            if not razao.strip():
+                erro = "Informe a Razão Social."
+            elif len(dig) not in (11, 14):
+                erro = "CNPJ (14 dígitos) ou CPF (11 dígitos) inválido."
+            elif not cod:
+                erro = "Informe o Código."
+            elif not regime:
+                erro = "Escolha o Regime."
+            elif cod in set(ativas["_cod"]):
+                erro = f"Já existe uma empresa ATIVA com o código {cod}."
+            elif dig.zfill(14) in set(ativas["_cnpj"]):
+                erro = "Já existe uma empresa ATIVA com esse CNPJ."
+            if erro:
+                aviso.error(erro)
+            else:
+                with st.spinner("Gravando na planilha..."):
+                    ok, resp = _empresas_enviar("incluir", [{"campos": {
+                        "Razão Social": razao.strip().upper(),
+                        "CNPJ": dig,
+                        "Código": cod,
+                        "Situação": "ATIVA",
+                        "Regime": regime,
+                        "Município": municipio.strip().upper(),
+                        "Estado": estado.strip().upper(),
+                    }}])
+                if ok:
+                    linha = (resp.get("linhas") or ["?"])[0]
+                    st.session_state["emp_msgs"] = [("ok", f"✅ {razao.strip().upper()} incluída na planilha "
+                                                           f"(linha {linha}) como ATIVA.")]
+                    le_planilha_google.clear()
+                    st.rerun()
+                else:
+                    aviso.error(f"Não foi possível incluir: {resp}")
+
+
+def _empresas_form_excluir(df, aviso=st):
+    ativas = _empresas_ativas(df)
+    with st.container(border=True):
+        st.markdown("**🗑️ Excluir empresa**")
+        st.caption("A empresa não é apagada da planilha: a Situação dela passa a ser "
+                   "INATIVA e ela sai das listas do sistema.")
+        n = st.session_state.get("emp_excluir_n", 0)   # muda após excluir → campos limpos
+        rotulos = {i: f"{r['_cod']} — {r.get('Razão Social', '')} — "
+                      f"{_formata_cnpj_mascara(r['_cnpj']) if r['_cnpj'] else ''}"
+                   for i, r in ativas.iterrows()}
+        sel = st.selectbox("Empresa", list(rotulos), index=None, format_func=rotulos.get,
+                           placeholder="Digite o código, nome ou CNPJ", key=f"emp_excluir_sel_{n}")
+        confirma = st.checkbox("Confirmo que esta empresa deve ficar INATIVA", key=f"emp_excluir_ok_{n}")
+        if st.button("🗑️ Excluir (inativar)", type="primary", disabled=sel is None or not confirma,
+                     key="emp_excluir_btn"):
+            r = ativas.loc[sel]
+            with st.spinner("Gravando na planilha..."):
+                ok, resp = _empresas_enviar("inativar", [{"codigo": r["_cod"], "cnpj": r["_cnpj"]}])
+            if ok:
+                st.session_state["emp_msgs"] = [("ok", f"✅ {r.get('Razão Social', '')} (cód. {r['_cod']}) "
+                                                       f"agora está INATIVA na planilha.")]
+                st.session_state["emp_excluir_n"] = n + 1
+                le_planilha_google.clear()
+                st.rerun()
+            else:
+                aviso.error(f"Não foi possível excluir: {resp}")
+
+
+def _empresas_incluir_excluir(df):
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.caption("Incluir e excluir empresa grava direto na planilha do escritório.")
+    _empresas_mensagens()
+    # Botões em vez de st.expander: o expander fecha sozinho a cada clique
+    # dentro dele (escolher a empresa, marcar a confirmação...).
+    acao = st.segmented_control("Gerenciar empresas", ["➕ Incluir empresa", "🗑️ Excluir empresa"],
+                                key="emp_acao", label_visibility="collapsed")
+    aviso = st.container()
+    if acao == "➕ Incluir empresa":
+        _empresas_form_incluir(df, aviso)
+    elif acao == "🗑️ Excluir empresa":
+        _empresas_form_excluir(df, aviso)
+
+
 def pagina_empresas():
     st.empty()
     df = le_planilha_google(GOOGLE_SHEET_URL, SHEET_EMPRESAS)
@@ -1411,6 +1560,8 @@ def pagina_empresas():
     df_empresas.to_excel(output, index=False)
     st.download_button("Baixar Excel", data=output.getvalue(), file_name="empresas.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    _empresas_incluir_excluir(df)
 
 
 import re  # adicione no topo do arquivo se ainda não tiver
@@ -3175,7 +3326,7 @@ _CND_FUNDOS = {"Negativa": "#f0faf4", "Positiva c/ Efeito de Negativa": "#eef5fc
                "Positiva": "#fdf2f2", "Sem CND": "#f4f6f6", "Filial": "#f5eef8"}
 
 
-def _cnpj_digitos(val):
+def _cert_cnpj_digitos(val):
     """CNPJ só com dígitos (14). Na planilha ele chega como número (float) e
     perde o zero à esquerda — str(float) ainda deixaria um '.0' no fim."""
     if isinstance(val, float):
@@ -3231,18 +3382,25 @@ def _drive_lista_pasta(pasta_id):
     return itens
 
 
+def _sem_acento(txt):
+    """Nome de pasta comparável: "Visão" == "VISAO" == "visao"."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(txt).strip().upper())
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
 @st.cache_data(ttl=600)
 def _certidoes_links_pdf():
     """{esfera: {código: link do PDF}}. Esfera ou escritório sem pasta → {}.
     Devolve também o erro (texto) se o Drive não respondeu."""
     links = {e: {} for e in CERTIDOES_ESFERAS}
     try:
-        esferas = {n.upper(): i for n, i, pasta in _drive_lista_pasta(CERTIDOES_DRIVE_PASTA) if pasta}
+        esferas = {_sem_acento(n): i for n, i, pasta in _drive_lista_pasta(CERTIDOES_DRIVE_PASTA) if pasta}
         for esfera in CERTIDOES_ESFERAS:
             if esfera not in esferas:
                 continue
-            escr = {n.upper(): i for n, i, pasta in _drive_lista_pasta(esferas[esfera]) if pasta}
-            pasta_escr = escr.get(CERTIDOES_ESCRITORIO.upper())
+            escr = {_sem_acento(n): i for n, i, pasta in _drive_lista_pasta(esferas[esfera]) if pasta}
+            pasta_escr = escr.get(_sem_acento(CERTIDOES_ESCRITORIO))
             if not pasta_escr:
                 continue
             for nome, arq_id, pasta in _drive_lista_pasta(pasta_escr):
@@ -3269,14 +3427,14 @@ def _certidoes_monta(df_empresas, df_aba, so_matriz, links_pdf):
     else:
         eh_filial = pd.Series(False, index=df.index)
 
-    df["_cnpj"] = df["CNPJ"].apply(_cnpj_digitos)
+    df["_cnpj"] = df["CNPJ"].apply(_cert_cnpj_digitos)
     df["Código"] = df["Código"].apply(_limpa_codigo_sf)
 
     sit = {}
     val = {}
     if df_aba is not None and {"CNPJ", "Situação"}.issubset(df_aba.columns):
         aba = df_aba[df_aba["CNPJ"].notna()].copy()
-        aba["_cnpj"] = aba["CNPJ"].apply(_cnpj_digitos)
+        aba["_cnpj"] = aba["CNPJ"].apply(_cert_cnpj_digitos)
         aba = aba[aba["_cnpj"] != ""].drop_duplicates("_cnpj", keep="last")
         sit = dict(zip(aba["_cnpj"], aba["Situação"]))
         if "Validade" in aba.columns:
