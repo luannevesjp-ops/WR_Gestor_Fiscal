@@ -1330,7 +1330,7 @@ if st.session_state["menu_area"] == "FISCAL":
                            "DMS", "SERVIÇOS TOMADOS", "SEFAZ", "LEITURA XML DMS", "LEITURA XML REST","SEFAZ ALTERAÇÃO QUANTIDADE NOTAS"]
 
 elif st.session_state["menu_area"] == "PARALEGAL":
-    paginas_disponiveis = ["DASHBOARD", "EMPRESAS", "CND MUNICIPAL", "SEM ACESSO", "ALVARÁS"]
+    paginas_disponiveis = ["DASHBOARD", "EMPRESAS", "CERTIDÕES", "SEM ACESSO", "ALVARÁS"]
 
 elif st.session_state["menu_area"] == "CONTÁBIL":
     paginas_disponiveis = ["EMPRESAS"]
@@ -3150,138 +3150,352 @@ def pagina_sefaz():
     )
 
 
-def pagina_cnd_municipal():
+# ============================================================================
+# CERTIDÕES (FEDERAL / ESTADUAL / MUNICIPAL) — substitui o antigo CND MUNICIPAL
+# ============================================================================
+# Situação e validade vêm de uma aba por esfera na planilha do escritório
+# (colunas CNPJ / Situação / Validade). Os PDFs ficam na pasta CERTIDÕES do
+# Drive: <pasta>/<ESFERA>/<escritório>/_<código>_<nome>_CND <ESFERA>.pdf.
+# A pasta é pública ("qualquer pessoa com o link"), então a lista de arquivos é
+# lida direto da página embeddedfolderview do Drive — sem Apps Script.
+CERTIDOES_DRIVE_PASTA = "1hthi4fMVPX1X8JisI2-XCEK15w5_qRbC"
+CERTIDOES_ESCRITORIO  = "WR"   # nome da subpasta do escritório em cada esfera
+CERTIDOES_ESFERAS = {
+    # esfera: (aba da planilha, só matriz?)
+    "FEDERAL":   ("CND FEDERAL",  True),
+    "ESTADUAL":  ("CND ESTADUAL", False),
+    "MUNICIPAL": ("CND",          False),
+}
+CERTIDOES_DIAS_VENCENDO = 15   # vencendo: até 15 dias antes; vencida: a partir do dia seguinte ao vencimento
+
+_CND_STATUS = ["Negativa", "Positiva c/ Efeito de Negativa", "Positiva", "Sem CND"]
+_CND_CORES  = {"Negativa": "#27ae60", "Positiva c/ Efeito de Negativa": "#2e86de",
+               "Positiva": "#e74c3c", "Sem CND": "#95a5a6"}
+_CND_FUNDOS = {"Negativa": "#f0faf4", "Positiva c/ Efeito de Negativa": "#eef5fc",
+               "Positiva": "#fdf2f2", "Sem CND": "#f4f6f6"}
+
+
+def _cnpj_digitos(val):
+    """CNPJ só com dígitos (14). Na planilha ele chega como número (float) e
+    perde o zero à esquerda — str(float) ainda deixaria um '.0' no fim."""
+    if isinstance(val, float):
+        if pd.isna(val):
+            return ""
+        val = int(val)
+    d = re.sub(r"\D", "", str(val))
+    return d.zfill(14) if d else ""
+
+
+def _cnd_classifica(val):
+    v = str(val).strip().upper() if pd.notna(val) else ""
+    if v in ("", "NAN", "NONE"):
+        return "Sem CND"
+    if "EFEITO" in v:
+        return "Positiva c/ Efeito de Negativa"
+    if "NEGATIVA" in v:
+        return "Negativa"
+    if "POSITIVA" in v:
+        return "Positiva"
+    return "Sem CND"
+
+
+@st.cache_data(ttl=600)
+def _certidoes_carregar_abas():
+    """Lê as abas de CND da planilha num download só. {aba: df ou None} — None
+    quando a aba ainda não existe (ex.: CND ESTADUAL antes de ser criada)."""
+    resp = requests.get(GOOGLE_SHEET_URL, timeout=60)
+    resp.raise_for_status()
+    xls = pd.ExcelFile(BytesIO(resp.content), engine="openpyxl")
+    abas = {}
+    for aba, _ in CERTIDOES_ESFERAS.values():
+        if aba in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=aba)
+            df.columns = df.columns.astype(str).str.strip()
+            abas[aba] = df
+        else:
+            abas[aba] = None
+    return abas
+
+
+def _drive_lista_pasta(pasta_id):
+    """[(nome, id, é_pasta)] de uma pasta pública do Drive."""
+    import html as _html
+    resp = requests.get(f"https://drive.google.com/embeddedfolderview?id={pasta_id}", timeout=20)
+    resp.raise_for_status()
+    itens = []
+    for href, nome in re.findall(r'<a href="([^"]+)"[^>]*>.*?flip-entry-title">([^<]+)<',
+                                 resp.text, re.S):
+        m = re.search(r"/(folders|file/d)/([\w-]+)", href)
+        if m:
+            itens.append((_html.unescape(nome).strip(), m.group(2), m.group(1) == "folders"))
+    return itens
+
+
+@st.cache_data(ttl=600)
+def _certidoes_links_pdf():
+    """{esfera: {código: link do PDF}}. Esfera ou escritório sem pasta → {}.
+    Devolve também o erro (texto) se o Drive não respondeu."""
+    links = {e: {} for e in CERTIDOES_ESFERAS}
+    try:
+        esferas = {n.upper(): i for n, i, pasta in _drive_lista_pasta(CERTIDOES_DRIVE_PASTA) if pasta}
+        for esfera in CERTIDOES_ESFERAS:
+            if esfera not in esferas:
+                continue
+            escr = {n.upper(): i for n, i, pasta in _drive_lista_pasta(esferas[esfera]) if pasta}
+            pasta_escr = escr.get(CERTIDOES_ESCRITORIO.upper())
+            if not pasta_escr:
+                continue
+            for nome, arq_id, pasta in _drive_lista_pasta(pasta_escr):
+                m = re.match(r"^_(\d+)_", nome)
+                if pasta or not m or not nome.lower().endswith(".pdf"):
+                    continue
+                links[esfera][m.group(1)] = f"https://drive.google.com/file/d/{arq_id}/view"
+        return links, ""
+    except Exception as e:
+        return links, str(e)
+
+
+def _certidoes_monta(df_empresas, df_aba, so_matriz, links_pdf):
+    """Uma linha por empresa ATIVA (sem CEI), com a situação da CND casada pelo
+    CNPJ. Empresa que não está na aba (ou está sem situação) = Sem CND."""
+    df = df_empresas[
+        (df_empresas["Situação"].astype(str).str.strip().str.upper() == "ATIVA") &
+        (df_empresas["Regime"].astype(str).str.strip().str.upper() != "CEI")
+    ].copy()
+    if so_matriz and "MATRIZ / FILIAL" in df.columns:
+        df = df[df["MATRIZ / FILIAL"].astype(str).str.strip().str.upper() != "FILIAL"]
+
+    df["_cnpj"] = df["CNPJ"].apply(_cnpj_digitos)
+    df["Código"] = df["Código"].apply(_limpa_codigo_sf)
+
+    sit = {}
+    val = {}
+    if df_aba is not None and {"CNPJ", "Situação"}.issubset(df_aba.columns):
+        aba = df_aba[df_aba["CNPJ"].notna()].copy()
+        aba["_cnpj"] = aba["CNPJ"].apply(_cnpj_digitos)
+        aba = aba[aba["_cnpj"] != ""].drop_duplicates("_cnpj", keep="last")
+        sit = dict(zip(aba["_cnpj"], aba["Situação"]))
+        if "Validade" in aba.columns:
+            datas = aba["Validade"].apply(_normaliza_data_br)
+            val = dict(zip(aba["_cnpj"], pd.to_datetime(datas, format="%d/%m/%Y", errors="coerce")))
+
+    df["Situação CND"] = df["_cnpj"].map(sit).apply(_cnd_classifica)
+    validade = pd.to_datetime(df["_cnpj"].map(val), errors="coerce")
+    hoje = pd.Timestamp(date.today())
+    dias = (validade - hoje).dt.days
+
+    def _venc(d, s):
+        if s == "Sem CND" or pd.isna(d):
+            return "—"
+        if d < 0:
+            return "Vencida"
+        if d <= CERTIDOES_DIAS_VENCENDO:
+            return "Vencendo"
+        return "Em dia"
+
+    df["Validade"] = validade.dt.strftime("%d/%m/%Y").fillna("")
+    df["Dias"] = dias.astype("Int64")
+    df["Vencimento"] = [_venc(d, s) for d, s in zip(dias, df["Situação CND"])]
+    df["CNPJ"] = df["_cnpj"].apply(lambda c: _formata_cnpj_mascara(c) if c else "")
+    df["PDF"] = df["Código"].map(links_pdf).fillna("")
+
+    colunas = ["PDF", "Código", "Razão Social", "CNPJ", "Regime", "Município", "Estado",
+               "Situação CND", "Validade", "Dias", "Vencimento"]
+    return df[[c for c in colunas if c in df.columns]].reset_index(drop=True)
+
+
+@st.dialog("Certidões — Empresas", width="large")
+def _modal_certidoes(titulo, df_show):
+    st.markdown(f"**{titulo}** — {df_show.shape[0]} empresa(s)")
+    cols = [c for c in ["Código", "Razão Social", "CNPJ", "Município", "Estado",
+                        "Situação CND", "Validade", "Dias", "Vencimento", "PDF"]
+            if c in df_show.columns]
+    st.dataframe(
+        df_show[cols].reset_index(drop=True), use_container_width=True, hide_index=True,
+        column_config={"PDF": st.column_config.LinkColumn("PDF", display_text="Abrir PDF")},
+    )
+
+
+def _certidoes_grid(df_tabela, grid_key):
+    """AgGrid com a lupa 🔎 que abre o PDF numa aba nova (mesmo renderer da
+    SITUAÇÃO FISCAL > EMPRESAS)."""
+    from st_aggrid import JsCode
+    gb = GridOptionsBuilder.from_dataframe(df_tabela)
+    gb.configure_default_column(filter=True, sortable=True, editable=False, resizable=True,
+                                 wrapHeaderText=True, autoHeaderHeight=True)
+    for col in df_tabela.columns:
+        if col == "PDF":
+            continue
+        gb.configure_column(col, filter="agTextColumnFilter")
+    lupa_renderer = JsCode("""
+        class LupaPdfRenderer {
+            init(params) {
+                this.eGui = document.createElement('span');
+                if (params.value) {
+                    this.eGui.innerHTML =
+                        '<a href="' + params.value + '" target="_blank" rel="noopener" ' +
+                        'style="font-size:18px; text-decoration:none;" title="Abrir PDF">🔎</a>';
+                }
+            }
+            getGui() { return this.eGui; }
+            refresh(params) { return false; }
+        }
+    """)
+    gb.configure_column("PDF", header_name="PDF", cellRenderer=lupa_renderer,
+                         filter=False, sortable=False, resizable=False,
+                         suppressSizeToFit=True, width=64, pinned="left",
+                         cellStyle={"textAlign": "center"})
+    gb.configure_grid_options(
+        domLayout="normal", floatingFilter=True, headerHeight=40, rowHeight=30,
+        enableBrowserTooltips=True, enableCellTextSelection=True, suppressMenuHide=True,
+        localeText={
+            'filterOoo': 'Filtrar...', 'contains': 'Contém', 'notContains': 'Não contém',
+            'equals': 'Igual', 'notEqual': 'Diferente', 'blank': 'Em branco',
+            'notBlank': 'Não em branco', 'noRowsToShow': 'Nenhum registro para mostrar',
+        }
+    )
+    AgGrid(df_tabela, gridOptions=gb.build(), height=450, key=grid_key,
+           columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
+           enable_enterprise_modules=False, allow_unsafe_jscode=True, reload_data=False)
+
+
+def _certidoes_esfera(esfera, df_cert, aba, aba_existe, so_matriz, n_pdfs):
+    import plotly.graph_objects as go
+
+    cont = {s: int((df_cert["Situação CND"] == s).sum()) for s in _CND_STATUS}
+    vencidas  = int((df_cert["Vencimento"] == "Vencida").sum())
+    vencendo  = int((df_cert["Vencimento"] == "Vencendo").sum())
+    total     = len(df_cert)
+    base      = "empresas ativas (só matriz), sem CEI" if so_matriz else "empresas ativas, sem CEI"
+
+    st.markdown(
+        f"<p style='text-align:right; font-size:18px;'>"
+        f"<b>Negativas:</b> {cont['Negativa']} &nbsp;|&nbsp; "
+        f"<b>Positivas c/ efeito de negativa:</b> {cont['Positiva c/ Efeito de Negativa']} &nbsp;|&nbsp; "
+        f"<b>Positivas:</b> {cont['Positiva']} &nbsp;|&nbsp; "
+        f"<b>Sem CND:</b> {cont['Sem CND']} &nbsp;|&nbsp; "
+        f"<b>Total:</b> {total}</p>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Total = {base}. Situação e validade: aba **{aba}** da planilha · "
+               f"{n_pdfs} PDF(s) na pasta {esfera}/{CERTIDOES_ESCRITORIO} do Drive.")
+    if not aba_existe:
+        st.warning(f"A aba **{aba}** ainda não existe na planilha — todas as empresas "
+                   f"aparecem como Sem CND até ela ser criada (colunas CNPJ / Situação / Validade).")
+
+    # ── donut (mesmo padrão do menu SIMPLES NACIONAL) ──────────────────────────
+    fig = go.Figure(data=[go.Pie(
+        labels=_CND_STATUS,
+        values=[cont[s] for s in _CND_STATUS],
+        hole=0.68,
+        marker=dict(colors=[_CND_CORES[s] for s in _CND_STATUS],
+                    line=dict(color="#ffffff", width=3)),
+        textinfo="none",
+        hovertemplate="<b>%{label}</b><br>%{value} empresa(s) — %{percent}<extra></extra>",
+        direction="clockwise",
+        sort=False,
+    )])
+    fig.update_layout(
+        paper_bgcolor="white", plot_bgcolor="white",
+        showlegend=False,
+        margin=dict(t=20, b=20, l=20, r=20),
+        height=300,
+        annotations=[dict(
+            text=f"<b>{total}</b><br><span style='font-size:11px'>empresas</span>",
+            x=0.5, y=0.5, xanchor="center", yanchor="middle", showarrow=False,
+            font=dict(size=22, color="#1d3f77"),
+        )],
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_cert_{esfera}")
+
+    def _card(cor, fundo, valor, rotulo):
+        st.markdown(
+            f"<div style='text-align:center; padding:8px; background:{fundo}; "
+            f"border-radius:8px; border-left:4px solid {cor};'>"
+            f"<span style='font-size:22px; font-weight:700; color:{cor};'>{valor}</span><br>"
+            f"<span style='font-size:13px; color:#555;'>{rotulo}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    cols = st.columns(len(_CND_STATUS))
+    for col, s in zip(cols, _CND_STATUS):
+        with col:
+            pct = round(cont[s] / total * 100) if total else 0
+            _card(_CND_CORES[s], _CND_FUNDOS[s], cont[s], f"{s} ({pct}%)")
+            if st.button("Ver empresas", use_container_width=True, key=f"btn_cert_{esfera}_{s}",
+                         disabled=cont[s] == 0):
+                _modal_certidoes(f"{esfera} — {s}", df_cert[df_cert["Situação CND"] == s])
+
+    st.write("")
+    col_v1, col_v2 = st.columns(2)
+    with col_v1:
+        _card("#c0392b", "#fdf2f2", vencidas, "Vencidas")
+        if st.button("Ver vencidas", use_container_width=True, key=f"btn_cert_{esfera}_venc",
+                     disabled=vencidas == 0):
+            _modal_certidoes(f"{esfera} — Vencidas", df_cert[df_cert["Vencimento"] == "Vencida"])
+    with col_v2:
+        _card("#e67e22", "#fef5ec", vencendo, f"Vencendo em até {CERTIDOES_DIAS_VENCENDO} dias")
+        if st.button("Ver vencendo", use_container_width=True, key=f"btn_cert_{esfera}_vcdo",
+                     disabled=vencendo == 0):
+            _modal_certidoes(f"{esfera} — Vencendo", df_cert[df_cert["Vencimento"] == "Vencendo"])
+
+    st.divider()
+
+    # ── filtro rápido ──────────────────────────────────────────────────────────
+    opcoes = {
+        f"Vencidas ({vencidas})": ("Vencimento", "Vencida"),
+        f"Vencendo ({vencendo})": ("Vencimento", "Vencendo"),
+        **{f"{s} ({cont[s]})": ("Situação CND", s) for s in _CND_STATUS},
+    }
+    sel = st.pills("Filtro", list(opcoes), selection_mode="single",
+                   key=f"pill_cert_{esfera}")
+    df_tab = df_cert
+    if sel:
+        col_f, valor_f = opcoes[sel]
+        df_tab = df_cert[df_cert[col_f] == valor_f]
+    st.caption(f"{len(df_tab)} empresa(s) exibida(s) · 🔎 abre o PDF da certidão")
+
+    df_tab = _sanitiza_df(df_tab.copy())
+    # chave muda com o filtro: o AgGrid usa reload_data=False e ignoraria dado novo
+    _certidoes_grid(df_tab, f"grid_cert_{esfera}_{abs(hash(sel or 'todas'))}")
+
+    output = BytesIO()
+    df_tab.to_excel(output, index=False)
+    st.download_button(
+        "📥 Baixar Excel", data=output.getvalue(),
+        file_name=f"certidoes_{esfera.lower()}_{date.today().strftime('%d-%m-%Y')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"btn_xlsx_cert_{esfera}",
+    )
+
+
+def pagina_certidoes():
     st.empty()
     df = le_planilha_google(GOOGLE_SHEET_URL, SHEET_EMPRESAS)
     if df is None:
         return
-    
-    competencia_raw = df.get("PERÍODO DE COMPETÊNCIA", [""])[0]
-    competencia = formata_mes_ano(competencia_raw) if competencia_raw else ""
-    
-    df_cnd = df[df["Situação"].astype(str).str.upper() == "ATIVA"] if "Situação" in df.columns else pd.DataFrame()
-    if df_cnd.empty:
-        st.warning("Nenhuma empresa ATIVA encontrada.")
+    if not {"Situação", "Regime", "CNPJ", "Código"}.issubset(df.columns):
+        st.error("A aba GERAL precisa das colunas Código, CNPJ, Situação e Regime.")
         return
-    
-    colunas_solicitadas = ["Código", "Razão Social", "CNPJ", "Município", "Estado", 
-                           "SITUAÇÃO CND MUNICIPAL", "VALIDADE", "LINK CND MUNICIPAL", "Situação"]
-    colunas_existentes = [c for c in colunas_solicitadas if c in df_cnd.columns]
-    df_cnd = df_cnd[colunas_existentes].copy()
-    
-    if "VALIDADE" in df_cnd.columns:
-        df_cnd["VALIDADE"] = pd.to_datetime(df_cnd["VALIDADE"], errors='coerce').dt.strftime("%d/%m/%Y").fillna("")
-    
-    def check_pdf_link(link):
-        return "Disponível" if pd.notna(link) and str(link).strip() != "" else "Indisponível"
-    
-    if "LINK CND MUNICIPAL" in df_cnd.columns:
-        df_cnd["PDF"] = df_cnd["LINK CND MUNICIPAL"].apply(check_pdf_link)
-    else:
-        df_cnd["PDF"] = "Indisponível"
-    
-    if "SITUAÇÃO CND MUNICIPAL" in df_cnd.columns:
-        situacao_upper = df_cnd["SITUAÇÃO CND MUNICIPAL"].astype(str).str.upper().str.strip()
-        positivas = (situacao_upper == "POSITIVA").sum()
-        negativas = (situacao_upper == "NEGATIVA").sum()
-        positiva_efeito_negativa = (situacao_upper == "POSITIVA COM EFEITO NEGATIVA").sum()
-    if "SITUAÇÃO CND MUNICIPAL" in df_cnd.columns:
-        situacao_upper = df_cnd["SITUAÇÃO CND MUNICIPAL"].astype(str).str.upper().str.strip()
-        positivas = (situacao_upper == "POSITIVA").sum()
-        negativas = (situacao_upper == "NEGATIVA").sum()
-        positiva_efeito_negativa = (situacao_upper == "POSITIVA COM EFEITO NEGATIVA").sum()
-        nao_geradas = ((situacao_upper == "") | (situacao_upper == "NAN") | df_cnd["SITUAÇÃO CND MUNICIPAL"].isna()).sum()
-    else:
-        positivas = negativas = positiva_efeito_negativa = nao_geradas = 0
-    
-    total_geral = df_cnd.shape[0]
-    
-    if "visualizando_pdf" not in st.session_state:
-        st.session_state.visualizando_pdf = False
-        st.session_state.pdf_selecionado = None
-    
-    if st.session_state.visualizando_pdf and st.session_state.pdf_selecionado:
-        col1, col2 = st.columns([6, 1])
-        
-        with col1:
-            if st.button("← Voltar para a lista", type="primary"):
-                st.session_state.visualizando_pdf = False
-                st.session_state.pdf_selecionado = None
-                st.rerun()
-        
-        with col2:
-            row = st.session_state.pdf_selecionado
-            link_pdf = row.get("LINK CND MUNICIPAL", "")
-            
-            if link_pdf and "drive.google.com" in str(link_pdf):
-                if "/file/d/" in link_pdf:
-                    file_id = link_pdf.split("/file/d/")[1].split("/")[0]
-                    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-                    
-                    st.markdown(
-                        f'<a href="{download_url}" target="_blank">'
-                        f'<button style="background-color:#1d3f77; color:white; padding:8px 16px; '
-                        f'border:none; border-radius:4px; cursor:pointer; font-size:14px;">'
-                        f'📥 Baixar PDF</button></a>',
-                        unsafe_allow_html=True
-                    )
-        
-        st.divider()
-        row = st.session_state.pdf_selecionado
-        cnpj = row.get("CNPJ", "")
-        razao = row.get("Razão Social", "")
-        link_pdf = row.get("LINK CND MUNICIPAL", "")
-        status_pdf = row.get("PDF", "Indisponível")
-        
-        st.subheader(f"📄 {razao}")
-        st.caption(f"CNPJ: {cnpj}")
-        
-        if status_pdf == "Disponível" and link_pdf:
-            try:
-                if "drive.google.com" in str(link_pdf):
-                    if "/file/d/" in link_pdf:
-                        file_id = link_pdf.split("/file/d/")[1].split("/")[0]
-                        embed_url = f"https://drive.google.com/file/d/{file_id}/preview"
-                        st.markdown(f'<iframe src="{embed_url}" width="100%" height="800" frameborder="0"></iframe>',
-                                    unsafe_allow_html=True)
-                    else:
-                        st.error("❌ Formato de link do Google Drive não reconhecido")
-                        st.info(f"Link: {link_pdf}")
-                else:
-                    st.markdown(f'<iframe src="{link_pdf}" width="100%" height="800" frameborder="0"></iframe>',
-                                unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"❌ Erro ao carregar PDF: {e}")
-                st.info(f"Link: {link_pdf}")
-        else:
-            st.error("❌ PDF não disponível")
-            st.info("Link do PDF não foi encontrado na planilha (coluna LINK CND MUNICIPAL)")
-    else:
-        st.markdown(f"<h2>CND Municipal</h2><p style='text-align:right; font-size:20px;'>"
-                    f"<b>Positivas:</b> {positivas} | <b>Negativas:</b> {negativas} | "
-                    f"<b>Positiva c/ efeito negativa:</b> {positiva_efeito_negativa} | "
-                    f"<b>Não geradas:</b> {nao_geradas} | <b>Total:</b> {total_geral} | "
-                    f"<b>Competência:</b> {competencia}</p>", unsafe_allow_html=True)
-        
-        st.info("💡 Selecione uma linha na tabela para visualizar o PDF correspondente.")
-        
-        with st.container():
-            df_cnd = _sanitiza_df(df_cnd)
-            grid_response = exibe_aggrid_com_oculta(df_cnd, height=400, grid_key="grid_cnd_municipal",
-                                                     selection_mode='single',
-                                                     colunas_ocultas=["Situação", "LINK CND MUNICIPAL"])
-        
-        selected_rows = grid_response.get('selected_rows', [])
-        if selected_rows is not None and len(selected_rows) > 0:
-            row = selected_rows.iloc[0].to_dict() if isinstance(selected_rows, pd.DataFrame) else selected_rows[0]
-            st.session_state.pdf_selecionado = row
-            st.session_state.visualizando_pdf = True
-            st.rerun()
-        
-        output = BytesIO()
-        df_cnd.to_excel(output, index=False)
-        st.download_button("📥 Baixar Excel", data=output.getvalue(), file_name="cnd_municipal.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    try:
+        abas = _certidoes_carregar_abas()
+    except Exception as e:
+        st.error(f"Erro ao ler as abas de CND da planilha: {e}")
+        return
+    links, erro_drive = _certidoes_links_pdf()
+
+    st.markdown("<h2>CERTIDÕES</h2>", unsafe_allow_html=True)
+    if erro_drive:
+        st.warning(f"Não foi possível ler a pasta de PDFs no Drive ({erro_drive}). "
+                   f"As certidões aparecem sem o link do PDF.")
+
+    tabs = st.tabs(list(CERTIDOES_ESFERAS))
+    for tab, (esfera, (aba, so_matriz)) in zip(tabs, CERTIDOES_ESFERAS.items()):
+        with tab:
+            df_cert = _certidoes_monta(df, abas.get(aba), so_matriz, links.get(esfera, {}))
+            _certidoes_esfera(esfera, df_cert, aba, abas.get(aba) is not None,
+                              so_matriz, len(links.get(esfera, {})))
 
 
 # ============================================================================
@@ -5202,8 +5416,8 @@ with st.session_state.main_container.container():
         pagina_leitura_xml_dms()
     elif pagina == "LEITURA XML REST":
         pagina_leitura_xml_rest()    
-    elif pagina == "CND MUNICIPAL":
-        pagina_cnd_municipal()
+    elif pagina == "CERTIDÕES":
+        pagina_certidoes()
     elif pagina == "SEM ACESSO":
         pagina_sem_acesso()
     elif pagina == "SEFAZ ALTERAÇÃO QUANTIDADE NOTAS":
